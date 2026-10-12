@@ -1,4 +1,5 @@
 # Nix packages to build statically (attribute names under pkgsStatic)
 # One package per line. Lines starting with # are ignored.
 hello
-dig
+socat
+chisel
