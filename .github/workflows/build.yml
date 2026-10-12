@@ -1,0 +1,89 @@
+name: Build Static Packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - packages.txt
+      - NIXPKGS_REV
+  workflow_dispatch:
+
+jobs:
+  load-packages:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      rev: ${{ steps.rev.outputs.rev }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read package list
+        id: set-matrix
+        run: |
+          matrix=$(grep -v '^\s*#' packages.txt | grep -v '^\s*$' | jq -R . | jq -s -c .)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+      - name: Read nixpkgs revision
+        id: rev
+        run: echo "rev=$(tr -d '[:space:]' < NIXPKGS_REV)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: load-packages
+    if: ${{ needs.load-packages.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: ${{ fromJson(needs.load-packages.outputs.matrix) }}
+      fail-fast: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Build ${{ matrix.package }}
+        run: |
+          rev="${{ needs.load-packages.outputs.rev }}"
+          nix-build "https://github.com/NixOS/nixpkgs/archive/${rev}.tar.gz" \
+            -A "pkgsStatic.${{ matrix.package }}" \
+            -o result
+
+      - name: Package binaries
+        run: |
+          pkg="${{ matrix.package }}"
+          mkdir -p staging
+
+          if [ -d result/bin ]; then
+            cp -rL result/bin/* staging/
+          else
+            cp -rL result/* staging/
+          fi
+
+          echo "--- Built files ---"
+          file staging/*
+          ls -lh staging/
+
+          tar czf "${pkg}-x86_64-linux.tar.gz" -C staging .
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pkg="${{ matrix.package }}"
+          rev="${{ needs.load-packages.outputs.rev }}"
+          short_rev="${rev:0:8}"
+          tag="${pkg}-latest"
+
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create "$tag" \
+            "${pkg}-x86_64-linux.tar.gz" \
+            --title "${pkg} (nixpkgs ${short_rev})" \
+            --notes "Static build of **${pkg}** for x86_64-linux.
+
+          Built from [nixpkgs \`${short_rev}\`](https://github.com/NixOS/nixpkgs/commit/${rev}).
+
+          \`\`\`
+          tar xzf ${pkg}-x86_64-linux.tar.gz -C /usr/local/bin
+          \`\`\`"
