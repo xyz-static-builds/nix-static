@@ -9,31 +9,89 @@ on:
   workflow_dispatch:
 
 jobs:
-  load-packages:
+  detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      rev: ${{ steps.rev.outputs.rev }}
+      matrix: ${{ steps.detect.outputs.matrix }}
+      rev: ${{ steps.detect.outputs.rev }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read package list
-        id: set-matrix
+      - uses: cachix/install-nix-action@v31
+
+      - name: Detect changed packages
+        id: detect
         run: |
-          matrix=$(grep -v '^\s*#' packages.txt | grep -v '^\s*$' | jq -R . | jq -s -c .)
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          rev=$(tr -d '[:space:]' < NIXPKGS_REV)
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
 
-      - name: Read nixpkgs revision
-        id: rev
-        run: echo "rev=$(tr -d '[:space:]' < NIXPKGS_REV)" >> "$GITHUB_OUTPUT"
+          current_packages=$(grep -v '^\s*#' packages.txt | grep -v '^\s*$')
+
+          before="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || \
+             [ -z "$before" ] || \
+             [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base commit — building all packages"
+            matrix=$(echo "$current_packages" | jq -R . | jq -s -c .)
+            echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prev_packages=$(git show "${before}:packages.txt" 2>/dev/null \
+            | grep -v '^\s*#' | grep -v '^\s*$' || echo "")
+          prev_rev=$(git show "${before}:NIXPKGS_REV" 2>/dev/null \
+            | tr -d '[:space:]' || echo "")
+
+          nixpkgs_changed=false
+          if [ "$prev_rev" != "$rev" ] && [ -n "$prev_rev" ]; then
+            nixpkgs_changed=true
+          fi
+
+          changed=()
+
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+
+            if ! echo "$prev_packages" | grep -qxF "$pkg"; then
+              echo "New package: $pkg"
+              changed+=("$pkg")
+              continue
+            fi
+
+            if [ "$nixpkgs_changed" = true ]; then
+              old_drv=$(nix-instantiate --expr \
+                '(import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/'"${prev_rev}"'.tar.gz") {}).pkgsStatic.'"${pkg}" \
+                2>/dev/null || echo "missing")
+              new_drv=$(nix-instantiate --expr \
+                '(import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/'"${rev}"'.tar.gz") {}).pkgsStatic.'"${pkg}" \
+                2>/dev/null || echo "error")
+
+              if [ "$old_drv" != "$new_drv" ]; then
+                echo "Changed: $pkg"
+                changed+=("$pkg")
+              else
+                echo "Unchanged: $pkg"
+              fi
+            fi
+          done <<< "$current_packages"
+
+          if [ ${#changed[@]} -eq 0 ]; then
+            echo "No packages need rebuilding"
+            echo 'matrix=[]' >> "$GITHUB_OUTPUT"
+          else
+            matrix=$(printf '%s\n' "${changed[@]}" | jq -R . | jq -s -c .)
+            echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
-    needs: load-packages
-    if: ${{ needs.load-packages.outputs.matrix != '[]' }}
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.matrix != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        package: ${{ fromJson(needs.load-packages.outputs.matrix) }}
+        package: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
       fail-fast: false
     permissions:
       contents: write
@@ -44,7 +102,7 @@ jobs:
 
       - name: Build ${{ matrix.package }}
         run: |
-          rev="${{ needs.load-packages.outputs.rev }}"
+          rev="${{ needs.detect-changes.outputs.rev }}"
           nix-build "https://github.com/NixOS/nixpkgs/archive/${rev}.tar.gz" \
             -A "pkgsStatic.${{ matrix.package }}" \
             -o result
@@ -71,7 +129,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pkg="${{ matrix.package }}"
-          rev="${{ needs.load-packages.outputs.rev }}"
+          rev="${{ needs.detect-changes.outputs.rev }}"
           short_rev="${rev:0:8}"
           tag="${pkg}-latest"
 
